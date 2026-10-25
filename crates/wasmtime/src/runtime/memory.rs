@@ -3,7 +3,6 @@ use crate::prelude::*;
 use crate::runtime::vm::{self, ExportMemory};
 use crate::store::{StoreInstanceId, StoreOpaque, StoreResourceLimiter};
 use crate::trampoline::generate_memory_export;
-#[cfg(feature = "async")]
 use crate::vm::VMStore;
 use crate::{AsContext, AsContextMut, Engine, MemoryType, StoreContext, StoreContextMut};
 use alloc::sync::Arc;
@@ -737,22 +736,61 @@ impl Memory {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn shrink(&self, mut store: impl AsContextMut, new_size: u64) -> Result<u64> {
+    pub fn shrink(&self, store: impl AsContextMut, new_size: u64) -> Result<u64> {
+        // Retain the checked API's requirement that all calls have returned
+        self.shrink_impl(store, new_size, false)
+    }
+
+    /// Shrink an ordinary memory synchronously inside a cooperative allocator callback.
+    ///
+    /// Unlike [`Memory::shrink`], this permits live Wasm calls. Requires
+    /// [`Config::shared_memory_shrink`](crate::Config::shared_memory_shrink),
+    /// which also selects explicit bounds checks. The allocator immediately
+    /// discards/decommits the tail; all other restrictions of `shrink` apply.
+    /// The default mmap allocator supports it. Pooling is unsupported; custom
+    /// allocators must explicitly implement [`LinearMemory::shrink_to_coordinated`].
+    ///
+    /// # Safety
+    ///
+    /// The entire tail must have been relinquished by every guest and host
+    /// user, including outstanding references, slices, memory operations and
+    /// suspended frames. Serialize the operation with all allocator operations
+    /// and apply it before releasing the allocator lock. Running code may retain
+    /// older bounds checks; nobody may use the tail until subsequent growth.
+    pub unsafe fn shrink_coordinated(
+        &self,
+        store: impl AsContextMut,
+        new_size: u64,
+    ) -> Result<u64> {
+        // Apply the request synchronously under the unsafe allocator coordination contract
+        self.shrink_impl(store, new_size, true)
+    }
+
+    fn shrink_impl(
+        &self,
+        mut store: impl AsContextMut,
+        new_size: u64,
+        coordinated: bool,
+    ) -> Result<u64> {
         // Validate quiescence and all module minimums before modifying the allocation
         let (mut limiter, store) = store.as_context_mut().0.resource_limiter_and_store_opaque();
+        ensure!(
+            !coordinated || store.engine().config().shared_memory_shrink,
+            "coordinated shrinking was not enabled in the engine configuration"
+        );
         let definition = store[self.instance].memory_ptr(self.index);
         let page_size = self.wasmtime_ty(store).page_size();
         let new_bytes = new_size
             .checked_mul(page_size)
             .and_then(|size| usize::try_from(size).ok())
             .context("requested memory size overflows the host address space")?;
-        store.validate_memory_shrink(definition, new_bytes)?;
+        store.validate_memory_shrink(definition, new_bytes, coordinated)?;
 
         // Resize the allocation and publish its new bounds to every importing instance
-        let old_bytes = self
-            .instance
-            .get_mut(store)
-            .memory_shrink(self.index, new_bytes)?;
+        let old_bytes =
+            self.instance
+                .get_mut(store)
+                .memory_shrink(self.index, new_bytes, coordinated)?;
         if old_bytes != new_bytes {
             if let Some(limiter) = limiter.as_mut() {
                 limiter.memory_shrunk(old_bytes, new_bytes);
@@ -879,7 +917,10 @@ impl Memory {
 ///
 /// - **Size.** [`byte_size`] must be at least `minimum` after creation
 /// and at least `new_size` after a successful call to [`grow_to`],
-/// and it must never decrease.
+/// and it must never decrease except through this fork's explicit shrink
+/// operations. The internal deferred shared-memory wrapper may retain accessible
+/// backing after a logical shrink only with explicit bounds checks configured
+/// and under the unsafe allocator coordination contract.
 ///
 /// - **Base pointer stability.** A call to [`as_ptr`] must return the same
 /// address until the next successful call to [`grow_to`].
@@ -949,6 +990,27 @@ pub unsafe trait LinearMemory: Any + Send + Sync {
         // Reject shrinking unless the backing allocator explicitly implements it
         let _ = new_size;
         bail!("this linear memory allocator does not support shrinking")
+    }
+
+    /// Optionally shrink while other runners may still use the retained prefix.
+    ///
+    /// Implementations must not access or invalidate that prefix and must meet
+    /// the size, base stability, discarded-content and error guarantees of
+    /// [`LinearMemory::shrink_to`]. The default rejects the operation even if
+    /// ordinary `shrink_to` is implemented: that implementation may rely on
+    /// store quiescence. Wasmtime's mmap allocator explicitly supports this.
+    ///
+    /// # Safety
+    ///
+    /// The caller must relinquish the entire removed tail across all guest and
+    /// host users, including references, pending accesses and atomic waiters,
+    /// and prevent reuse until growth. The backing's mutable metadata must be
+    /// exclusively accessible to this call, but retained bytes may be used by
+    /// other runners. The caller must validate the size and preserve all minima.
+    unsafe fn shrink_to_coordinated(&mut self, new_size: usize) -> Result<()> {
+        // Require a separate opt-in rather than invoking an allocator that assumes quiescence
+        let _ = new_size;
+        bail!("this linear memory allocator does not support coordinated shrinking")
     }
 
     /// Return the allocated memory as a mutable pointer to u8.
@@ -1268,7 +1330,8 @@ impl SharedMemory {
     /// # Safety
     ///
     /// The returned slice is valid for the entire duration of the lifetime of
-    /// this instance of [`SharedMemory`]. The base pointer of a shared memory
+    /// this instance of [`SharedMemory`], unless the caller invokes the unsafe
+    /// shrink/reclaim extension and assumes its additional obligations. The base pointer of a shared memory
     /// does not change. This [`SharedMemory`] may grow further after this
     /// function has been called, but the slice returned will not grow.
     ///
@@ -1309,6 +1372,69 @@ impl SharedMemory {
             }
             None => bail!("failed to grow memory by `{delta}`"),
         }
+    }
+
+    /// Immediately reduce the logical size to an absolute number of Wasm pages.
+    ///
+    /// Requires [`Config::shared_memory_shrink`](crate::Config::shared_memory_shrink).
+    /// Other runners may continue executing in the retained region. Backing pages
+    /// are retained until [`SharedMemory::reclaim`] and are zeroed before regrowth.
+    /// The base address, declared limits and reservation do not change. Growth,
+    /// shrinking and reclamation are serialized internally.
+    ///
+    /// Returns the previous page count. Errors leave the size unchanged, including
+    /// targets above the current size, overflow, disabled support, and targets
+    /// below a defining/importing minimum. Import minimums are pinned for this
+    /// allocation's lifetime, even after an importing store is dropped. Component
+    /// imports disable shrinking of the allocation; a previously shrunk allocation
+    /// cannot subsequently be imported into a component.
+    ///
+    /// # Safety
+    ///
+    /// This is a cooperative allocator extension, not a general operation on
+    /// arbitrary Wasm. The caller must serialize the request with every allocator
+    /// operation and relinquish the entire removed tail, including allocations,
+    /// stacks, TLS, host accesses, pending memory operations and atomic waiters.
+    /// No thread may access that tail until it has been exposed by subsequent
+    /// growth. Previously loaded bounds are not invalidated in running code.
+    /// Do not defer a guest's request past the point where its allocator lock is
+    /// released; an unchanged page count does not establish that the tail is unused.
+    #[cfg(feature = "threads")]
+    pub unsafe fn shrink(&self, new_size: u64) -> Result<u64> {
+        // Publish the allocator-coordinated request before its callback returns to the guest
+        self.vm.shrink(new_size)
+    }
+
+    /// Reclaim backing still outside this shared memory's current logical size.
+    ///
+    /// This does not change `memory.size`. It recomputes the removed tail under
+    /// the growth lock, so regrown pages cannot be reclaimed by an older request.
+    /// Whole host pages are decommitted; any partial host page is retained.
+    /// Allocation/OS errors leave the logical size unchanged and can be retried.
+    /// Custom allocators without [`LinearMemory::shrink_to_coordinated`] reject reclamation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no thread can access the tail from the
+    /// current logical end through [`SharedMemory::backing_size`], including
+    /// atomic waiters and operations using previously checked bounds. Rust
+    /// references/slices covering that tail must have been dropped, even if
+    /// only their retained prefix was used. Coordinate this with the guest
+    /// allocator and host memory users; stopping all runners is sufficient but
+    /// is not necessary if these obligations are otherwise met.
+    #[cfg(feature = "threads")]
+    pub unsafe fn reclaim(&self) -> Result<()> {
+        // Reclaim only the still-unused tail under the same lock used by growth
+        self.vm.reclaim()
+    }
+
+    /// Return the backing extent in bytes, including logically removed bytes
+    /// retained until [`SharedMemory::reclaim`]. The OS can retain a partial host
+    /// page beyond this extent. This is a snapshot, not a synchronization guard.
+    #[cfg(feature = "threads")]
+    pub fn backing_size(&self) -> usize {
+        // Report retained backing independently of the logical data size
+        self.vm.backing_size()
     }
 
     /// Returns a stable identifier for this shared memory when introspecting
@@ -1406,7 +1532,13 @@ impl SharedMemory {
 
     /// Construct a single-memory instance to provide a way to import
     /// [`SharedMemory`] into other modules.
-    pub(crate) fn vmimport(&self, store: &mut StoreOpaque) -> crate::runtime::vm::VMMemoryImport {
+    pub(crate) fn vmimport(
+        &self,
+        store: &mut StoreOpaque,
+        minimum: u64,
+    ) -> Result<crate::runtime::vm::VMMemoryImport> {
+        // Pin each importing minimum before exposing this memory to another instance
+        self.vm.register_minimum(minimum)?;
         // Note `vm::assert_ready` shouldn't panic here because this isn't
         // actually allocating any new memory (also no limiter), so resource
         // limiting shouldn't kick in.
@@ -1419,7 +1551,7 @@ impl SharedMemory {
         .unwrap();
         match memory {
             ExportMemory::Unshared(_) => unreachable!(),
-            ExportMemory::Shared(_shared, vmimport) => vmimport,
+            ExportMemory::Shared(_shared, vmimport) => Ok(vmimport),
         }
     }
 

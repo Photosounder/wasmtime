@@ -6,7 +6,7 @@ use crate::runtime::vm::{self, Memory, VMMemoryDefinition, WaitResult};
 use std::cell::RefCell;
 use std::ops::Range;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use wasmtime_environ::Trap;
@@ -27,6 +27,50 @@ struct SharedMemoryInner {
     spot: ParkingSpot,
     ty: wasmtime_environ::Memory,
     def: LongTermVMMemoryDefinition,
+    shrink_minimum: AtomicUsize,
+}
+
+/// Separate the published logical size from backing retained for later reclamation.
+///
+/// This wrapper is installed only with explicit bounds checks enabled. Its
+/// inaccessible-tail contract is replaced by the unsafe shared-shrink protocol.
+struct DeferredSharedMemory {
+    backing: Box<dyn crate::LinearMemory>,
+    logical: usize,
+    ever_shrunk: bool,
+}
+
+// SAFETY: The backing preserves alignment, reservation and base stability; the
+// opt-in compiler configuration and unsafe caller contract govern retained pages
+unsafe impl crate::LinearMemory for DeferredSharedMemory {
+    fn byte_size(&self) -> usize {
+        // Report the logical extent to growth and size queries
+        self.logical
+    }
+
+    fn byte_capacity(&self) -> usize {
+        // Preserve the backing allocation's stable reservation
+        self.backing.byte_capacity()
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        // Keep the base address unchanged across logical resizing
+        self.backing.as_ptr()
+    }
+
+    fn grow_to(&mut self, new_size: usize) -> Result<()> {
+        // Commit additional pages only when growth exceeds the retained backing
+        if new_size > self.backing.byte_size() {
+            self.backing.grow_to(new_size)?;
+        }
+
+        // Zero regrown bytes before they become visible and cancel their pending reclamation
+        unsafe {
+            core::ptr::write_bytes(self.as_ptr().add(self.logical), 0, new_size - self.logical);
+        }
+        self.logical = new_size;
+        Ok(())
+    }
 }
 
 impl SharedMemory {
@@ -53,7 +97,7 @@ impl SharedMemory {
     pub fn wrap(
         engine: &Engine,
         ty: &wasmtime_environ::Memory,
-        memory: LocalMemory,
+        mut memory: LocalMemory,
     ) -> Result<Self> {
         if !engine.config().shared_memory {
             bail!(
@@ -63,12 +107,112 @@ impl SharedMemory {
         if !ty.shared {
             bail!("shared memory must have a `shared` memory type");
         }
+
+        // Retain removed backing only for engines explicitly configured for cooperative shrinking
+        if engine.config().shared_memory_shrink {
+            let logical = memory.byte_size();
+            memory.alloc = try_new::<Box<_>>(DeferredSharedMemory {
+                backing: memory.alloc,
+                logical,
+                ever_shrunk: false,
+            })?;
+        }
         Ok(Self(try_new::<Arc<_>>(SharedMemoryInner {
             ty: *ty,
             spot: ParkingSpot::default(),
             def: LongTermVMMemoryDefinition(memory.vmmemory()),
             memory: RwLock::new(memory),
+            shrink_minimum: AtomicUsize::new(usize::try_from(ty.minimum_byte_size()?)?),
         })?))
+    }
+
+    /// Pin an importing module's minimum for the lifetime of this shared allocation.
+    pub(crate) fn register_minimum(&self, pages: u64) -> Result<()> {
+        // Recheck cached import matches while excluding concurrent shrink and growth
+        let memory = self.0.memory.write().unwrap();
+        let bytes = pages
+            .checked_mul(self.0.ty.page_size())
+            .and_then(|n| usize::try_from(n).ok())
+            .context("import minimum overflows the host address space")?;
+        ensure!(
+            bytes <= memory.byte_size(),
+            "shared memory is smaller than the importing module's minimum"
+        );
+        self.0.shrink_minimum.fetch_max(bytes, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Exclude component imports whose additional state this extension does not track.
+    #[cfg(feature = "component-model")]
+    pub(crate) fn disable_shrinking(&self) -> Result<()> {
+        // Serialize the exclusion with all logical size changes
+        let memory = self.0.memory.write().unwrap();
+        let allocation: &dyn core::any::Any = &*memory.alloc;
+        if let Some(allocation) = allocation.downcast_ref::<DeferredSharedMemory>() {
+            ensure!(
+                !allocation.ever_shrunk,
+                "a previously shrunk shared memory cannot be imported into a component"
+            );
+        }
+        self.0.shrink_minimum.store(usize::MAX, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Publish a smaller logical size while leaving its backing accessible.
+    ///
+    /// The unsafe public API establishes that no users access the removed tail.
+    pub(crate) fn shrink(&self, pages: u64) -> Result<u64> {
+        // Validate limits while excluding growth, other shrinks and new importing minimums
+        let mut memory = self.0.memory.write().unwrap();
+        let bytes = pages
+            .checked_mul(self.0.ty.page_size())
+            .and_then(|n| usize::try_from(n).ok())
+            .context("requested memory size overflows the host address space")?;
+        let old = memory.byte_size();
+        ensure!(bytes <= old, "shrinking cannot increase memory size");
+        ensure!(
+            bytes >= self.0.shrink_minimum.load(Ordering::SeqCst),
+            "shrinking cannot go below a defining or importing module's minimum, or shrink a component memory"
+        );
+        let allocation: &mut dyn core::any::Any = &mut *memory.alloc;
+        let allocation = allocation
+            .downcast_mut::<DeferredSharedMemory>()
+            .context("shared memory shrinking was not enabled in the engine configuration")?;
+
+        // Publish allocator bookkeeping before the shared length observed by Wasm
+        allocation.ever_shrunk |= bytes < old;
+        allocation.logical = bytes;
+        self.0.def.0.current_length.store(bytes, Ordering::SeqCst);
+        Ok(u64::try_from(old).unwrap() / self.0.ty.page_size())
+    }
+
+    /// Release only the backing that is still outside the current logical extent.
+    pub(crate) fn reclaim(&self) -> Result<()> {
+        // Derive the reclamation range afresh under the same lock used by growth
+        let mut memory = self.0.memory.write().unwrap();
+        let allocation: &mut dyn core::any::Any = &mut *memory.alloc;
+        let allocation = allocation
+            .downcast_mut::<DeferredSharedMemory>()
+            .context("shared memory shrinking was not enabled in the engine configuration")?;
+        if allocation.logical < allocation.backing.byte_size() {
+            // The unsafe public reclaim API excludes every user of the currently removed tail
+            unsafe {
+                allocation
+                    .backing
+                    .shrink_to_coordinated(allocation.logical)?
+            };
+        }
+        Ok(())
+    }
+
+    /// Return the backing extent, which can exceed the logical length.
+    pub(crate) fn backing_size(&self) -> usize {
+        // Inspect the retained allocation without racing a resize
+        let memory = self.0.memory.read().unwrap();
+        let allocation: &dyn core::any::Any = &*memory.alloc;
+        allocation
+            .downcast_ref::<DeferredSharedMemory>()
+            .map_or_else(|| memory.byte_size(), |a| a.backing.byte_size())
     }
 
     /// Return the memory type for this [`SharedMemory`].
@@ -220,3 +364,29 @@ thread_local! {
 struct LongTermVMMemoryDefinition(VMMemoryDefinition);
 unsafe impl Send for LongTermVMMemoryDefinition {}
 unsafe impl Sync for LongTermVMMemoryDefinition {}
+
+#[cfg(all(test, feature = "component-model", feature = "cranelift"))]
+mod shrink_component_tests {
+    use super::*;
+
+    #[test]
+    fn shrink_excludes_components_in_both_orders() -> Result<()> {
+        // Prevent component state from retaining assumptions about an allocation that has shrunk
+        let mut config = crate::Config::new();
+        config.shared_memory_shrink(true);
+        let engine = Engine::new(&config)?;
+        let ty = crate::MemoryType::shared(1, 8)?;
+        let memory = SharedMemory::new(&engine, ty.wasmtime_memory())?;
+        memory.grow(3)?;
+        memory.shrink(2)?;
+        memory.grow(2)?;
+        assert!(memory.disable_shrinking().is_err());
+
+        // Pin the exclusion before accepting an import into component state
+        let memory = SharedMemory::new(&engine, ty.wasmtime_memory())?;
+        memory.grow(3)?;
+        memory.disable_shrinking()?;
+        assert!(memory.shrink(2).is_err());
+        Ok(())
+    }
+}

@@ -71,6 +71,10 @@ define_tunables! {
         /// The size, in bytes, of the guard page region for linear memories.
         pub memory_guard_size: u64,
 
+        /// Require explicit bounds checks even when virtual-memory guards exist.
+        /// Used by this fork's allocator-coordinated memory shrinking extension.
+        pub force_memory_bounds_checks: bool,
+
         /// The size, in bytes, to allocate at the end of a relocated linear
         /// memory for growth.
         pub memory_reservation_for_growth: u64,
@@ -262,6 +266,7 @@ impl Tunables {
             // limits quite conservative.
             memory_reservation: 1 << 20,
             memory_guard_size: 0,
+            force_memory_bounds_checks: false,
             memory_reservation_for_growth: 0,
 
             // General options which have the same defaults regardless of

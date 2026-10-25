@@ -48,9 +48,11 @@ extension; the upstream binaries linked below do not include this fork's
 addition. Both MSVC and MSYS2/UCRT64 builds are supported.
 
 The guest-to-host command is application-defined: the embedder supplies the
-callback or import used by CIT Alloc. That callback must queue the requested
-target size rather than shrink immediately. After the outermost Wasm call has
-returned to C, apply the queued request:
+callback or import used by CIT Alloc. For allocator callbacks, use the
+[coordinated extension below](#cooperative-allocator-callbacks-and-shared-memories)
+to publish the smaller size before the allocator can reuse the tail. The checked
+`wasmtime_memory_shrink` API instead applies a host-owned, still-valid target
+after the outermost Wasm call has returned to C:
 
 ```c
 uint64_t previous_pages;
@@ -68,9 +70,11 @@ error and must release it with `wasmtime_error_delete` after handling it.
 The guest allocator must have relinquished the entire removed tail, and host
 pointers or slices into that tail must no longer be used. If the guest runs
 again before a queued request is applied, revalidate or cancel the request so
-that it cannot discard allocations that have reused the tail.
+that it cannot discard allocations that have reused the tail. Checking that the
+page count stayed unchanged is insufficient: an allocator can reuse the tail
+without growing memory. Never carry an absolute target across such reuse.
 
-The current implementation has these restrictions:
+The checked `wasmtime_memory_shrink` API has these restrictions:
 
 * Shrinking requires all calls into the store to have returned, including
   suspended asynchronous calls.
@@ -88,6 +92,75 @@ the [C API reference in the header](crates/c-api/include/wasmtime/memory.h) and
 the [complete C example](examples/memory-shrink.c) for details. The example
 demonstrates a deferred callback, error handling, and zeroed regrowth; it is
 available as the `wasmtime-memory-shrink` CMake target in `examples`.
+
+### Cooperative allocator callbacks and shared memories
+
+An opt-in extension supports CIT Alloc's synchronous shrink command while other
+Wasm runners continue executing. Configure the engine before loading modules:
+
+```c
+wasm_config_t *config = wasm_config_new();
+wasmtime_config_wasm_threads_set(config, true);
+wasmtime_config_shared_memory_shrink_set(config, true);
+wasm_engine_t *engine = wasm_engine_new_with_config(config);
+```
+
+While CIT Alloc still holds its allocator lock and has relinquished the entire
+tail, apply its absolute target immediately:
+
+```c
+uint64_t previous_pages;
+wasmtime_error_t *error = wasmtime_sharedmemory_shrink(
+    shared_memory, target_pages, &previous_pages);
+```
+
+Success returns `NULL` and updates C size queries, Wasm `memory.size`, and growth
+bookkeeping before the callback returns. Failure leaves the logical size and
+output argument unchanged; delete the returned error after handling it. The base
+address, declared limits, and virtual reservation stay unchanged. Import minimums
+are pinned conservatively for the allocation's lifetime, including after an
+importing store is dropped. Component imports disable shrinking of that memory;
+a previously shrunk allocation cannot subsequently be imported into a component.
+
+Logical shrink initially retains the backing pages. The host can query the
+retained extent with `wasmtime_sharedmemory_backing_size` and reclaim it with
+`wasmtime_sharedmemory_reclaim` when no guest or host user can access that tail.
+Reclamation recomputes the range under the growth lock, so intervening growth
+cannot cause an old request to decommit reused pages. Regrowth zeroes newly
+exposed bytes before publishing them. Whole host pages are decommitted; a partial
+host page is retained. A reclamation error leaves logical size unchanged and can
+be retried later. Custom backing must explicitly support coordinated shrinking
+through `LinearMemory::shrink_to_coordinated`; an implementation of the original
+quiescent shrink operation alone is insufficient.
+
+This extension has **unsafe caller obligations**. Every removed byte must be
+unused by all runners and host threads, including allocations, stacks, TLS,
+pending memory operations, references/slices, and atomic waiters. Nothing may use
+it until regrowth. Holding the guest allocator lock excludes reallocation but
+does not automatically exclude other host users. For physical reclamation, drop
+any Rust references/slices spanning the tail. Other runners may keep using the
+retained prefix. Running code can retain previously checked bounds; arbitrary
+concurrent tail access is not supported.
+
+The engine option enables shared memory and forces explicit bounds checks for
+retained pages without changing virtual reservations, guards, signal handling
+or Spectre mitigations. Shared memories still reserve their declared maximum.
+This can reduce memory-access performance. Cached modules compiled with different
+bounds-check settings are rejected. Engine creation rejects Winch and wmemcheck.
+The feature is disabled by default.
+
+For ordinary memories, `wasmtime_memory_shrink_coordinated` uses the same opt-in
+configuration and caller contract to shrink synchronously inside the callback;
+it also discards/decommits the tail immediately with the default mmap allocator.
+Pooling and custom allocators without coordinated support reject reductions.
+The original checked API keeps
+its requirement that all calls return first. Rust equivalents are the unsafe
+`SharedMemory::shrink`, `SharedMemory::reclaim`, and `Memory::shrink_coordinated`
+methods, configured with `Config::shared_memory_shrink`.
+
+See the [shared-memory C example](examples/shared-memory-shrink.c), available as
+the `wasmtime-shared-memory-shrink` CMake target, and the
+[shared-memory API reference](crates/c-api/include/wasmtime/sharedmemory.h).
 
 ### Rebuild with MSVC
 

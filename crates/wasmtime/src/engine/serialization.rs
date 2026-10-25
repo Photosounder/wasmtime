@@ -296,6 +296,7 @@ impl Metadata<'_> {
             collector,
             memory_reservation,
             memory_guard_size,
+            force_memory_bounds_checks,
             debug_native,
             debug_guest,
             debug_symbols,
@@ -361,6 +362,12 @@ impl Metadata<'_> {
             memory_guard_size,
             other.memory_guard_size,
             "memory guard size",
+        )?;
+        // Reject cached code whose guard-based bounds assumptions differ from this engine
+        Self::check_bool(
+            force_memory_bounds_checks,
+            other.force_memory_bounds_checks,
+            "explicit memory bounds checks",
         )?;
         Self::check_bool(
             debug_native,

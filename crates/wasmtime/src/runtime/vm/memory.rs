@@ -360,11 +360,11 @@ impl Memory {
         }
     }
 
-    /// Shrink a local memory after the caller has established store quiescence.
-    pub fn shrink_to(&mut self, new_size: usize) -> Result<usize> {
+    /// Shrink a local memory under quiescence or the unsafe allocator coordination contract.
+    pub fn shrink_to(&mut self, new_size: usize, coordinated: bool) -> Result<usize> {
         // Reject shared memories and delegate local allocation bookkeeping
         match self {
-            Memory::Local(mem) => mem.shrink_to(new_size),
+            Memory::Local(mem) => mem.shrink_to(new_size, coordinated),
             Memory::Shared(_) => bail!("shared memories cannot be shrunk"),
         }
     }
@@ -517,7 +517,7 @@ impl LocalMemory {
         &self.ty
     }
 
-    pub fn shrink_to(&mut self, new_size: usize) -> Result<usize> {
+    pub fn shrink_to(&mut self, new_size: usize, coordinated: bool) -> Result<usize> {
         // Preserve the allocation's minimum and reject requests that would grow it
         let old_size = self.alloc.byte_size();
         ensure!(
@@ -535,7 +535,12 @@ impl LocalMemory {
 
         // Leave no-op requests independent of allocator support
         if new_size != old_size {
-            self.alloc.shrink_to(new_size)?;
+            // Only the explicit unsafe entry point permits a coordinated backing operation
+            if coordinated {
+                unsafe { self.alloc.shrink_to_coordinated(new_size)? };
+            } else {
+                self.alloc.shrink_to(new_size)?;
+            }
         }
         Ok(old_size)
     }

@@ -200,6 +200,19 @@ WASMTIME_CONFIG_PROP(void, wasm_threads, bool)
 WASMTIME_CONFIG_PROP(void, shared_memory, bool)
 
 /**
+ * \brief Opts in to allocator-coordinated logical shrinking of shared memories.
+ *
+ * Disabled by default. Enabling this also enables shared memory and forces
+ * explicit bounds checks without changing reservations, guards, signal handling
+ * or Spectre mitigations. Engine creation fails if Winch is selected or wmemcheck
+ * is enabled. Shared memories still reserve their declared maximum.
+ * This can reduce memory-access performance. Running code can retain older
+ * bounds checks; this does not make arbitrary concurrent tail accesses safe.
+ * See #wasmtime_sharedmemory_shrink for the required allocator/host protocol.
+ */
+WASMTIME_CONFIG_PROP(void, shared_memory_shrink, bool)
+
+/**
  * \brief Configures whether the WebAssembly tail call proposal is enabled.
  *
  * This setting is `false` by default.

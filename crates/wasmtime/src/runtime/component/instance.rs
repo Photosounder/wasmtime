@@ -989,7 +989,7 @@ impl<'a> Instantiator<'a> {
         store: &mut StoreOpaque,
         module: &Module,
         args: impl Iterator<Item = &'b CoreDef>,
-    ) -> Result<&OwnedImports, OutOfMemory> {
+    ) -> Result<&OwnedImports> {
         self.core_imports.clear();
         self.core_imports.reserve(module)?;
         let mut imports = module.compiled_module().module().imports();

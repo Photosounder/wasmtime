@@ -1552,10 +1552,11 @@ impl StoreOpaque {
         &self,
         definition: NonNull<vm::VMMemoryDefinition>,
         new_size: usize,
+        coordinated: bool,
     ) -> Result<()> {
         // Exclude live calls and continuations that could retain previous bounds checks
         ensure!(
-            self.wasm_call_depth == 0,
+            coordinated || self.wasm_call_depth == 0,
             "memory shrinking requires all calls into the store to have returned"
         );
         #[cfg(feature = "stack-switching")]

@@ -170,6 +170,37 @@ wasmtime_memory_shrink(wasmtime_context_t *store,
                        const wasmtime_memory_t *memory, uint64_t new_size,
                        uint64_t *prev_size);
 
+/** \brief This fork provides synchronous allocator-coordinated shrinking. */
+#define WASMTIME_MEMORY_SHRINK_COORDINATED 1
+
+/**
+ * \brief Shrinks an ordinary memory synchronously inside an allocator callback.
+ *
+ * \param store the store owning memory
+ * \param memory the ordinary memory to shrink
+ * \param new_size absolute target size in Wasm pages
+ * \param prev_size receives the previous page count on success
+ *
+ * Requires #wasmtime_config_shared_memory_shrink_set before engine creation.
+ * Unlike #wasmtime_memory_shrink, live Wasm calls are allowed; all other runtime
+ * restrictions still apply. Tail pages are discarded/decommitted immediately
+ * using the default mmap allocator. Pooling and custom allocators without
+ * coordinated-shrink support reject reductions.
+ * Subsequent growth exposes zeroed bytes. NULL means success. On error,
+ * memory and prev_size are unchanged and the caller owns the returned error.
+ *
+ * \warning Serialize this operation with the guest allocator and apply it before
+ * its lock is released. Every guest/host user must have relinquished the entire
+ * tail, including live references/slices, pending operations and suspended
+ * frames. No code may access the tail until regrowth; previously loaded bounds
+ * in running code are not invalidated. Do not defer an absolute target across
+ * later allocations even when the memory page count stays unchanged.
+ */
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_memory_shrink_coordinated(wasmtime_context_t *store,
+                                  const wasmtime_memory_t *memory,
+                                  uint64_t new_size, uint64_t *prev_size);
+
 /**
  * \brief Returns the size of a page, in bytes, for this memory.
  *

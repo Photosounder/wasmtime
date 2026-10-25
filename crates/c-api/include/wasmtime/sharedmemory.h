@@ -101,6 +101,79 @@ WASM_API_EXTERN wasmtime_error_t *
 wasmtime_sharedmemory_grow(const wasmtime_sharedmemory_t *memory,
                            uint64_t delta, uint64_t *prev_size);
 
+#ifdef WASMTIME_FEATURE_THREADS
+
+/**
+ * \brief Immediately shrinks a shared memory's logical size, retaining backing.
+ *
+ * \param memory the shared memory to shrink
+ * \param new_size absolute target size in Wasm pages, not a page delta
+ * \param prev_size receives the previous page count on success
+ *
+ * Requires #wasmtime_config_shared_memory_shrink_set before creating the engine.
+ * On success returns NULL; C size queries, Wasm memory.size and subsequent growth
+ * use the smaller size before this call returns. The base address, declared
+ * limits and reservation do not change. Backing remains accessible until
+ * #wasmtime_sharedmemory_reclaim. Regrowth zeroes newly exposed bytes and prevents
+ * later reclamation of those bytes by an older shrink.
+ *
+ * Errors include disabled support, overflow, increasing size, a target below a
+ * defining/importing minimum, or component imports. Minimums are conservatively
+ * pinned for the allocation's lifetime, including after importing stores die.
+ * A previously shrunk allocation cannot subsequently be imported into a component.
+ * Errors leave the memory and prev_size unchanged. The caller owns the returned
+ * error and must release it with #wasmtime_error_delete.
+ *
+ * \warning This is an allocator-coordinated extension with unsafe caller
+ * obligations. Serialize the request with all guest allocator operations and
+ * relinquish the entire removed tail: no live allocations, stacks, TLS, host
+ * accesses, pending memory operations or atomic waiters may use it. No thread may
+ * access it until regrowth. Other runners may continue using the retained prefix.
+ * Previously checked bounds in running code are not invalidated. Apply a request
+ * synchronously while the allocator lock is held; never queue an absolute target
+ * across allocations that can reuse its tail, even if memory.size is unchanged.
+ */
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_sharedmemory_shrink(const wasmtime_sharedmemory_t *memory,
+                             uint64_t new_size, uint64_t *prev_size);
+
+/**
+ * \brief Reclaims backing still outside a shared memory's current logical size.
+ *
+ * \param memory the shared memory whose unused backing should be reclaimed
+ *
+ * Requires #wasmtime_config_shared_memory_shrink_set. Logical size is unchanged.
+ * The range is recomputed under the growth lock: intervening regrowth prevents
+ * stale reclamation of reused bytes. Whole host pages are decommitted and remain
+ * reserved; a partial host page is retained. Custom backing without coordinated-shrink
+ * support returns an error. NULL means success; the caller owns any returned
+ * error and must delete it with #wasmtime_error_delete. An error leaves logical
+ * size unchanged and reclamation can be retried later.
+ *
+ * \warning Ensure that no runner or host thread can access the entire unused
+ * tail, including pending operations using old bounds and atomic waiters. Drop
+ * any Rust references/slices spanning it. Coordinate with the allocator and host
+ * users; stopping all runners is sufficient but not required if this contract
+ * is otherwise met. Keeping the guest allocator lock held through shrink and
+ * reclaim is suitable only when all other tail users have also relinquished it.
+ */
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_sharedmemory_reclaim(const wasmtime_sharedmemory_t *memory);
+
+/**
+ * \brief Returns the backing extent in bytes, including a logically removed tail.
+ *
+ * \param memory the shared memory to query
+ *
+ * This snapshot can exceed #wasmtime_sharedmemory_data_size until reclamation.
+ * The OS can retain a partial host page beyond this extent. This query does not
+ * synchronize guest allocations or establish that any range is unused.
+ */
+WASM_API_EXTERN size_t
+wasmtime_sharedmemory_backing_size(const wasmtime_sharedmemory_t *memory);
+
+#endif // WASMTIME_FEATURE_THREADS
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

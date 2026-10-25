@@ -239,8 +239,12 @@ impl Instance {
         funcrefs.fill(modules);
 
         let mut owned_imports = OwnedImports::new(module)?;
-        for import in imports {
-            owned_imports.push(import, store)?;
+        for (import, (_, _, expected)) in imports
+            .iter()
+            .zip(module.compiled_module().module().imports())
+        {
+            // Pin shared importing minimums while materializing the checked imports
+            owned_imports.push(import, &expected, store)?;
         }
         Ok(owned_imports)
     }
@@ -691,7 +695,12 @@ impl OwnedImports {
         self.tags.clear();
     }
 
-    fn push(&mut self, item: &Extern, store: &mut StoreOpaque) -> Result<(), OutOfMemory> {
+    fn push(
+        &mut self,
+        item: &Extern,
+        expected: &EntityType,
+        store: &mut StoreOpaque,
+    ) -> Result<()> {
         match item {
             Extern::Func(i) => {
                 self.functions.push(i.vmimport(store))?;
@@ -706,7 +715,12 @@ impl OwnedImports {
                 self.memories.push(i.vmimport(store))?;
             }
             Extern::SharedMemory(i) => {
-                self.memories.push(i.vmimport(store))?;
+                // Revalidate cached matches and retain every importing module's minimum
+                let EntityType::Memory(expected) = expected else {
+                    unreachable!()
+                };
+                self.memories
+                    .push(i.vmimport(store, expected.limits.min)?)?;
             }
             Extern::Tag(i) => {
                 self.tags.push(i.vmimport(store))?;
@@ -722,7 +736,7 @@ impl OwnedImports {
         &mut self,
         store: &StoreOpaque,
         item: &crate::runtime::vm::Export,
-    ) -> Result<(), OutOfMemory> {
+    ) -> Result<()> {
         match item {
             crate::runtime::vm::Export::Function(f) => {
                 self.functions.push(f.vmimport(store))?;
@@ -736,7 +750,9 @@ impl OwnedImports {
             crate::runtime::vm::Export::Memory(m) => {
                 self.memories.push(m.vmimport(store))?;
             }
-            crate::runtime::vm::Export::SharedMemory(_, vmimport) => {
+            crate::runtime::vm::Export::SharedMemory(memory, vmimport) => {
+                // Exclude component state from the allocator-coordinated shrink extension
+                memory.disable_shrinking()?;
                 self.memories.push(*vmimport)?;
             }
             crate::runtime::vm::Export::Tag(t) => {
@@ -1005,7 +1021,10 @@ fn pre_instantiate_raw(
 
     let mut func_refs = func_refs.iter().map(|f| NonNull::from(f));
     let mut imports = OwnedImports::new(module)?;
-    for import in items.iter() {
+    for (import, (_, _, expected)) in items
+        .iter()
+        .zip(module.compiled_module().module().imports())
+    {
         if !import.comes_from_same_store(store) {
             bail!("cross-`Store` instantiation is not currently supported");
         }
@@ -1027,7 +1046,8 @@ fn pre_instantiate_raw(
                 .into()
             },
         };
-        imports.push(&item, store)?;
+        // Recheck shared memory minimums even for a previously typechecked InstancePre
+        imports.push(&item, &expected, store)?;
     }
 
     Ok(imports)

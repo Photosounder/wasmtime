@@ -99,6 +99,12 @@ impl MmapMemory {
             alloc_bytes = minimum_u64.saturating_add(extra_to_reserve_on_growth);
         }
 
+        // Shared memories must reserve their declared maximum because their base can never move
+        if ty.shared {
+            alloc_bytes = alloc_bytes.max(ty.maximum_byte_size()?);
+            extra_to_reserve_on_growth = 0;
+        }
+
         // Convert `alloc_bytes` and `extra_to_reserve_on_growth` to
         // page-aligned `usize` values.
         let alloc_bytes = HostAlignedByteCount::new_rounded_up_u64(alloc_bytes)
@@ -260,7 +266,7 @@ unsafe impl LinearMemory for MmapMemory {
 
         // Discard removed pages and leave their addresses reserved and inaccessible
         if !removed.is_zero() {
-            // SAFETY: LocalMemory validates the new size and the store has no live calls
+            // SAFETY: Checked callers exclude live calls and coordinated callers exclude all tail users
             unsafe {
                 crate::runtime::vm::sys::vm::erase_existing_mapping(
                     self.as_ptr().add(new_accessible.byte_count()),
@@ -279,6 +285,11 @@ unsafe impl LinearMemory for MmapMemory {
         }
         self.len = new_size;
         Ok(())
+    }
+
+    unsafe fn shrink_to_coordinated(&mut self, new_size: usize) -> Result<()> {
+        // Reuse the tail-only implementation under the caller's proof that no tail users remain
+        self.shrink_to(new_size)
     }
 
     fn init_from_image(&mut self, image: &MemoryImage) -> Result<bool> {

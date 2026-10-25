@@ -93,6 +93,12 @@ pub extern "C" fn wasmtime_config_shared_memory_set(c: &mut wasm_config_t, enabl
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_config_shared_memory_shrink_set(c: &mut wasm_config_t, enable: bool) {
+    // Configure explicit bounds checks and the opt-in shared allocator extension
+    c.config.shared_memory_shrink(enable);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_config_wasm_tail_call_set(c: &mut wasm_config_t, enable: bool) {
     c.config.wasm_tail_call(enable);
 }

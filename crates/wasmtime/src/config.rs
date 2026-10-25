@@ -200,6 +200,7 @@ pub struct Config {
     pub(crate) detect_host_feature: Option<fn(&str) -> Option<bool>>,
     pub(crate) x86_float_abi_ok: Option<bool>,
     pub(crate) shared_memory: bool,
+    pub(crate) shared_memory_shrink: bool,
     pub(crate) rr_config: RRConfig,
 }
 
@@ -316,6 +317,7 @@ impl Config {
             detect_host_feature: None,
             x86_float_abi_ok: None,
             shared_memory: false,
+            shared_memory_shrink: false,
             rr_config: RRConfig::None,
         };
         ret.wasm_backtrace_details(WasmBacktraceDetails::Environment);
@@ -2808,6 +2810,19 @@ impl Config {
 
         self.tunables.configure(&mut tunables);
 
+        // Require explicit bounds checks when logical shared-memory sizes can decrease
+        if self.shared_memory_shrink {
+            ensure!(
+                self.shared_memory,
+                "shared memory shrinking requires shared memory support"
+            );
+            tunables.force_memory_bounds_checks = true;
+            ensure!(
+                !self.wmemcheck,
+                "shared memory shrinking is incompatible with wmemcheck"
+            );
+        }
+
         // If no GC heap tunables are explicitly configured, copy the memory
         // tunables' configured values so that GC heaps default to the same
         // configuration as linear memories.
@@ -2858,6 +2873,12 @@ impl Config {
                 .as_ref()
                 .is_some_and(|c| c.strategy == Some(Strategy::Winch));
         }
+
+        // Validate the backend after resolving its calling convention
+        ensure!(
+            !self.shared_memory_shrink || !tunables.winch_callable,
+            "shared memory shrinking requires Cranelift"
+        );
 
         tunables.collector = if features.gc_types() {
             #[cfg(feature = "gc")]
@@ -3473,6 +3494,29 @@ impl Config {
     /// This option is `false` by default.
     pub fn shared_memory(&mut self, enable: bool) -> &mut Self {
         self.shared_memory = enable;
+        self
+    }
+
+    /// Opt in to allocator-coordinated logical shrinking of shared memories.
+    ///
+    /// This fork extension is disabled by default. Enabling it also enables
+    /// shared memories and forces explicit bounds checks without changing virtual
+    /// reservations, guard sizes, signal handling or Spectre mitigations.
+    /// Selecting Winch or enabling wmemcheck makes engine creation fail.
+    /// Shared memories still reserve their declared maximum and never move.
+    /// This also enables [`Memory::shrink_coordinated`](crate::Memory::shrink_coordinated)
+    /// for ordinary memories inside cooperative allocator callbacks.
+    ///
+    /// Shrinking remains an unsafe, cooperative operation: see
+    /// [`SharedMemory::shrink`](crate::SharedMemory::shrink). Running code can
+    /// retain a previously checked bound; enabling this option does not make
+    /// arbitrary concurrent accesses to a relinquished tail safe.
+    pub fn shared_memory_shrink(&mut self, enable: bool) -> &mut Self {
+        // Enable the runtime extension with the compiler settings required for retained backing
+        self.shared_memory_shrink = enable;
+        if enable {
+            self.shared_memory(true);
+        }
         self
     }
 

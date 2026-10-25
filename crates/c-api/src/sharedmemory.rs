@@ -58,3 +58,30 @@ pub extern "C" fn wasmtime_sharedmemory_grow(
 ) -> Option<Box<wasmtime_error_t>> {
     handle_result(mem.grow(delta), |prev| *prev_size = prev)
 }
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "threads")]
+pub unsafe extern "C" fn wasmtime_sharedmemory_shrink(
+    mem: &wasmtime_sharedmemory_t,
+    new_size: u64,
+    prev_size: &mut u64,
+) -> Option<Box<wasmtime_error_t>> {
+    // Publish the smaller extent only under the caller's allocator coordination contract
+    handle_result(unsafe { mem.shrink(new_size) }, |prev| *prev_size = prev)
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "threads")]
+pub unsafe extern "C" fn wasmtime_sharedmemory_reclaim(
+    mem: &wasmtime_sharedmemory_t,
+) -> Option<Box<wasmtime_error_t>> {
+    // Recompute the unused tail after excluding all accesses required by the caller contract
+    handle_result(unsafe { mem.reclaim() }, |()| ())
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "threads")]
+pub extern "C" fn wasmtime_sharedmemory_backing_size(mem: &wasmtime_sharedmemory_t) -> usize {
+    // Report retained backing separately from the immediately published logical length
+    mem.backing_size()
+}

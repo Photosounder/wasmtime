@@ -2411,7 +2411,10 @@ impl Memory {
     /// virtual memory traps (e.g. SIGSEGV) cannot be relied on to implement
     /// linear memory semantics.
     pub fn can_use_virtual_memory(&self, tunables: &Tunables, host_page_size_log2: u8) -> bool {
-        tunables.signals_based_traps && self.page_size_log2 >= host_page_size_log2
+        // Retained backing cannot act as a bound after a cooperative logical shrink
+        tunables.signals_based_traps
+            && !tunables.force_memory_bounds_checks
+            && self.page_size_log2 >= host_page_size_log2
     }
 
     /// Returns whether this memory is a candidate for bounds check elision

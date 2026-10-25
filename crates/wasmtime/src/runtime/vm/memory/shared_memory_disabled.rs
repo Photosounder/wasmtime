@@ -11,6 +11,17 @@ use wasmtime_environ::Trap;
 pub enum SharedMemory {}
 
 impl SharedMemory {
+    pub(crate) fn register_minimum(&self, _pages: u64) -> Result<()> {
+        // Shared memories cannot exist when thread support is disabled
+        match *self {}
+    }
+
+    #[cfg(feature = "component-model")]
+    pub(crate) fn disable_shrinking(&self) -> Result<()> {
+        // Shared memories cannot exist when thread support is disabled
+        match *self {}
+    }
+
     pub fn wrap(_: &Engine, _ty: &wasmtime_environ::Memory, _memory: LocalMemory) -> Result<Self> {
         bail!("support for shared memories was disabled at compile time");
     }

@@ -151,6 +151,19 @@ pub extern "C" fn wasmtime_memory_shrink(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasmtime_memory_shrink_coordinated(
+    store: WasmtimeStoreContextMut<'_>,
+    mem: &Memory,
+    new_size: u64,
+    prev_size: &mut u64,
+) -> Option<Box<wasmtime_error_t>> {
+    // Apply the request before the guest releases its allocator lock and can reuse the tail
+    handle_result(unsafe { mem.shrink_coordinated(store, new_size) }, |prev| {
+        *prev_size = prev
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_memory_page_size_log2(
     store: WasmtimeStoreContext<'_>,
     mem: &Memory,

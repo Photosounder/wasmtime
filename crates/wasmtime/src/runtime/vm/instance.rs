@@ -789,10 +789,11 @@ impl Instance {
         mut self: Pin<&mut Self>,
         index: DefinedMemoryIndex,
         new_size: usize,
+        coordinated: bool,
     ) -> Result<usize> {
         // Publish the changed length through the shared definition used by imports
         let memory = &mut self.as_mut().memories_mut()[index].1;
-        let old_size = memory.shrink_to(new_size)?;
+        let old_size = memory.shrink_to(new_size, coordinated)?;
         let definition = memory.vmmemory();
         self.set_memory(index, definition);
         Ok(old_size)
