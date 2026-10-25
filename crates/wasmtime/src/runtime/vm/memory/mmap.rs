@@ -249,6 +249,38 @@ unsafe impl LinearMemory for MmapMemory {
         }
     }
 
+    fn shrink_to(&mut self, new_size: usize) -> Result<()> {
+        // Compute the whole host pages that can be released without touching retained bytes
+        ensure!(
+            new_size <= self.len,
+            "shrinking cannot increase memory size"
+        );
+        let new_accessible = HostAlignedByteCount::new_rounded_up(new_size)?;
+        let removed = self.accessible().checked_sub(new_accessible)?;
+
+        // Discard removed pages and leave their addresses reserved and inaccessible
+        if !removed.is_zero() {
+            // SAFETY: LocalMemory validates the new size and the store has no live calls
+            unsafe {
+                crate::runtime::vm::sys::vm::erase_existing_mapping(
+                    self.as_ptr().add(new_accessible.byte_count()),
+                    removed.byte_count(),
+                )?;
+            }
+        }
+
+        // Clear the discarded suffix of a partial host page before publishing the new length
+        unsafe {
+            core::ptr::write_bytes(
+                self.as_ptr().add(new_size),
+                0,
+                new_accessible.byte_count() - new_size,
+            );
+        }
+        self.len = new_size;
+        Ok(())
+    }
+
     fn init_from_image(&mut self, image: &MemoryImage) -> Result<bool> {
         // Images always fit within the minimum size of a memory, which is
         // accessible from creation. If this ever changes our assumptions are incorrect for CoW, so

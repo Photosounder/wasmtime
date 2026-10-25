@@ -78,6 +78,13 @@ impl core::error::Error for MemoryAccessError {}
 ///   memory may change. Note that growth can also be requested from the
 ///   embedding API as well.
 ///
+/// * The host can also call [`Memory::shrink`] after all calls into the store
+///   have returned. Shrinking preserves the base pointer but invalidates raw
+///   pointers and slices that extend into the removed tail. Reacquire the
+///   memory's current size after giving other host code mutable access to the
+///   store, even when the base pointer is unchanged. If the memory grows again,
+///   the discarded bytes are zeroed; their previous contents are lost.
+///
 /// As a general rule of thumb it's recommended to stick to the safe methods of
 /// [`Memory`] if you can. It's not advised to use raw pointers or `unsafe`
 /// operations because of how easy it is to accidentally get things wrong.
@@ -139,8 +146,8 @@ impl core::error::Error for MemoryAccessError {}
 ///
 ///     // The `Memory` type may be stored in other locations, so if you hand
 ///     // off access to the `Store` then those locations may also call
-///     // `Memory::grow` or similar, so it's not enough to just audit code for
-///     // calls to `Memory::grow`.
+///     // `Memory::grow`, `Memory::shrink`, or similar, so it's not enough to
+///     // just audit code for calls to `Memory::grow`.
 ///     unsafe {
 ///         let pointer: &u8 = &*mem.data_ptr(&store);
 ///         some_other_function(store); // may invalidate `pointer` through use of `store`
@@ -644,6 +651,116 @@ impl Memory {
         vm::assert_ready(self._grow(store, limiter.as_mut(), delta))
     }
 
+    /// Shrinks this memory to `new_size` WebAssembly pages, returning its old size.
+    ///
+    /// The target size is absolute, not a number of pages to remove. Both the
+    /// target and returned size use this memory's [`page_size`](Memory::page_size),
+    /// which is 64KiB by default. Requesting the current size does not modify
+    /// the allocation, but still requires the store to meet the restrictions
+    /// below.
+    ///
+    /// This is a host extension, not a WebAssembly instruction. Removed bytes
+    /// are discarded and will be zero if the memory subsequently grows again.
+    /// The base pointer and virtual address reservation do not change.
+    ///
+    /// Shrinking must be deferred until all calls into this store have returned,
+    /// including suspended asynchronous calls. The new size must preserve the
+    /// declared minimum of the memory and every module that imports it.
+    ///
+    /// A Wasm-to-host callback must queue a request for the embedder to apply
+    /// after the outermost Wasm call returns. The guest allocator must have
+    /// relinquished the entire removed tail. If the guest runs again before a
+    /// queued request is applied, the embedder must ensure the tail has not
+    /// been reused. Wasmtime cannot identify live allocations in guest memory.
+    ///
+    /// Whole host pages beyond the new size are decommitted. A partial host
+    /// page is retained, with its discarded suffix zeroed. Raw pointers into
+    /// the removed region must no longer be used by the host or guest allocator.
+    ///
+    /// On success, [`Memory::size`], [`Memory::data_size`], and Wasm's
+    /// `memory.size` instruction observe the reduced size. The declared memory
+    /// type and its limits are unchanged. Successful size reductions notify
+    /// [`ResourceLimiter::memory_shrunk`](crate::ResourceLimiter::memory_shrunk)
+    /// or its asynchronous-limiter counterpart. The notification itself does
+    /// not suspend, so no asynchronous variant of this method is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without changing the memory if:
+    ///
+    /// * `new_size` exceeds the current size or its byte count overflows the
+    ///   host address space.
+    /// * The target is below the minimum declared by the defining memory or
+    ///   by any instantiated module that imports it, even without re-exporting it.
+    /// * A call into this store is still live or suspended.
+    /// * The store contains component instances or has allocated Wasm
+    ///   continuations, or `wmemcheck` is enabled.
+    /// * The backing allocator does not support shrinking, or this is a pooled
+    ///   memory using memory protection keys. The default mmap allocator and
+    ///   pooling without protection keys support shrinking; the malloc-backed
+    ///   allocator and custom allocators without [`LinearMemory::shrink_to`]
+    ///   support return an error for an actual size reduction.
+    /// * The backing allocator or operating system fails to release the removed
+    ///   pages.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this memory doesn't belong to `store`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use wasmtime::*;
+    /// # fn main() -> Result<()> {
+    /// // Create a core memory with a one-page minimum and grow it to three pages
+    /// let engine = Engine::default();
+    /// let mut store = Store::new(&engine, ());
+    /// let memory = Memory::new(&mut store, MemoryType::new(1, Some(3))?)?;
+    /// assert_eq!(memory.grow(&mut store, 2)?, 1);
+    /// let page_size = usize::try_from(memory.page_size(&store)).unwrap();
+    /// memory.data_mut(&mut store)[0] = 42;
+    /// memory.data_mut(&mut store)[page_size] = 99;
+    /// let base = memory.data_ptr(&store);
+    ///
+    /// // Apply the allocator's absolute target after all Wasm calls have returned
+    /// assert_eq!(memory.shrink(&mut store, 1)?, 3);
+    /// assert_eq!(memory.size(&store), 1);
+    /// assert_eq!(memory.data_size(&store), page_size);
+    /// assert_eq!(memory.data_ptr(&store), base);
+    /// assert_eq!(memory.data(&store)[0], 42);
+    /// assert!(memory.shrink(&mut store, 0).is_err());
+    ///
+    /// // Regrowth exposes zeroed bytes while preserving the retained contents
+    /// assert_eq!(memory.grow(&mut store, 1)?, 1);
+    /// assert_eq!(memory.data(&store)[page_size], 0);
+    /// assert_eq!(memory.data(&store)[0], 42);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn shrink(&self, mut store: impl AsContextMut, new_size: u64) -> Result<u64> {
+        // Validate quiescence and all module minimums before modifying the allocation
+        let (mut limiter, store) = store.as_context_mut().0.resource_limiter_and_store_opaque();
+        let definition = store[self.instance].memory_ptr(self.index);
+        let page_size = self.wasmtime_ty(store).page_size();
+        let new_bytes = new_size
+            .checked_mul(page_size)
+            .and_then(|size| usize::try_from(size).ok())
+            .context("requested memory size overflows the host address space")?;
+        store.validate_memory_shrink(definition, new_bytes)?;
+
+        // Resize the allocation and publish its new bounds to every importing instance
+        let old_bytes = self
+            .instance
+            .get_mut(store)
+            .memory_shrink(self.index, new_bytes)?;
+        if old_bytes != new_bytes {
+            if let Some(limiter) = limiter.as_mut() {
+                limiter.memory_shrunk(old_bytes, new_bytes);
+            }
+        }
+        Ok(u64::try_from(old_bytes).unwrap() / page_size)
+    }
+
     /// Async variant of [`Memory::grow`]. Required when using a
     /// [`ResourceLimiterAsync`](`crate::ResourceLimiterAsync`).
     ///
@@ -817,6 +934,22 @@ pub unsafe trait LinearMemory: Any + Send + Sync {
     /// of bytes. The error may be downcastable to `std::io::Error`.
     /// Returns `Ok` if memory was grown successfully.
     fn grow_to(&mut self, new_size: usize) -> Result<()>;
+
+    /// Optionally shrinks this memory to `new_size` bytes without moving its base.
+    ///
+    /// Wasmtime only requests page-aligned sizes between this memory's minimum
+    /// and its current size, with no live or suspended calls into the store.
+    /// On success, `byte_size()` must equal `new_size`, the remaining contents
+    /// must be preserved, and subsequent growth must zero all removed bytes.
+    /// The inaccessible-region safety requirements still apply. On error,
+    /// the size, contents, and accessibility must remain unchanged.
+    ///
+    /// The default implementation returns an unsupported-operation error.
+    fn shrink_to(&mut self, new_size: usize) -> Result<()> {
+        // Reject shrinking unless the backing allocator explicitly implements it
+        let _ = new_size;
+        bail!("this linear memory allocator does not support shrinking")
+    }
 
     /// Return the allocated memory as a mutable pointer to u8.
     fn as_ptr(&self) -> *mut u8;

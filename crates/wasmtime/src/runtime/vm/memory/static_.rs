@@ -112,4 +112,15 @@ unsafe impl LinearMemory for StaticMemory {
     fn as_ptr(&self) -> *mut u8 {
         self.base.as_ptr()
     }
+
+    fn shrink_to(&mut self, new_size: usize) -> Result<()> {
+        // Keep the pool slot's accessible extent consistent with this memory's length
+        ensure!(
+            new_size <= self.size,
+            "shrinking cannot increase memory size"
+        );
+        self.image_slot.shrink_heap_limit(new_size)?;
+        self.size = new_size;
+        Ok(())
+    }
 }

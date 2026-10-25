@@ -458,6 +458,44 @@ impl MemoryImageSlot {
         Ok(())
     }
 
+    pub(crate) fn shrink_heap_limit(&mut self, size_bytes: usize) -> Result<()> {
+        // Validate support and compute the suffix of this slot that must become inaccessible
+        ensure!(
+            self.pkey.is_none(),
+            "shrinking pooled memories with protection keys is not supported"
+        );
+        let aligned = HostAlignedByteCount::new_rounded_up(size_bytes)?;
+        let removed = self.accessible.checked_sub(aligned)?;
+        if let Some(image) = &self.image {
+            ensure!(
+                size_bytes >= image.linear_memory_offset.byte_count() + image.len.byte_count(),
+                "shrinking cannot discard a memory initialization image"
+            );
+        }
+
+        // Erase the tail in one operation so failure leaves the allocation unchanged
+        if !removed.is_zero() {
+            // SAFETY: The pool owns this slot and no Wasm calls can resume using its old size
+            unsafe {
+                vm::erase_existing_mapping(
+                    self.base.as_mut_ptr().add(aligned.byte_count()),
+                    removed.byte_count(),
+                )?;
+            }
+        }
+
+        // Zero the partial host page so regrowth cannot expose discarded bytes
+        unsafe {
+            core::ptr::write_bytes(
+                self.base.as_mut_ptr().add(size_bytes),
+                0,
+                aligned.byte_count() - size_bytes,
+            );
+        }
+        self.accessible = aligned;
+        Ok(())
+    }
+
     /// Prepares this slot for the instantiation of a new instance with the
     /// provided linear memory image.
     ///

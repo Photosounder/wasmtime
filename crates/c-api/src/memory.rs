@@ -140,6 +140,17 @@ pub extern "C" fn wasmtime_memory_page_size(store: WasmtimeStoreContext<'_>, mem
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_memory_shrink(
+    store: WasmtimeStoreContextMut<'_>,
+    mem: &Memory,
+    new_size: u64,
+    prev_size: &mut u64,
+) -> Option<Box<wasmtime_error_t>> {
+    // Return the previous page count only after shrinking succeeds
+    handle_result(mem.shrink(store, new_size), |prev| *prev_size = prev)
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_memory_page_size_log2(
     store: WasmtimeStoreContext<'_>,
     mem: &Memory,

@@ -1516,6 +1516,7 @@ pub(crate) struct EntryStoreContext {
     /// We need a pointer to the runtime limits, so we can update them from
     /// `drop`/`exit_wasm`.
     vm_store_context: *const VMStoreContext,
+    wasm_call_depth: *mut usize,
 }
 
 impl EntryStoreContext {
@@ -1599,6 +1600,10 @@ impl EntryStoreContext {
             stack_limit = Some(prev_stack);
         }
 
+        // Keep calls counted even while their asynchronous fiber is suspended
+        store.0.wasm_call_depth += 1;
+        let wasm_call_depth = &raw mut store.0.wasm_call_depth;
+
         unsafe {
             let vm_store_context = store.0.vm_store_context();
             let initial_stack_information = VmPtr::from(
@@ -1625,6 +1630,7 @@ impl EntryStoreContext {
                 last_wasm_entry_trap_handler: take(&vm_store_context.last_wasm_entry_trap_handler),
                 stack_chain,
                 vm_store_context,
+                wasm_call_depth,
             }
         }
     }
@@ -1635,6 +1641,11 @@ impl EntryStoreContext {
     /// panicking out of a Wasm execution).
     #[inline]
     fn exit_wasm(&mut self) {
+        // Release the quiescence guard only after this call can no longer resume
+        unsafe {
+            *self.wasm_call_depth -= 1;
+        }
+
         unsafe {
             if let Some(limit) = self.stack_limit {
                 *(&*self.vm_store_context).stack_limit.get() = limit;

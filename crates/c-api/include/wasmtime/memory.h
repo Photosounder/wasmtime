@@ -127,6 +127,50 @@ wasmtime_memory_grow(wasmtime_context_t *store, const wasmtime_memory_t *memory,
                      uint64_t delta, uint64_t *prev_size);
 
 /**
+ * \brief Shrinks a non-shared memory to `new_size` WebAssembly pages.
+ *
+ * \param store the store that owns `memory`
+ * \param memory the memory to shrink
+ * \param new_size the absolute target size, in WebAssembly pages
+ * \param prev_size where to store the previous size, in WebAssembly pages
+ *
+ * This is a host extension. The size is an absolute target, not a delta.
+ * On success, `prev_size` receives the previous page count and NULL is
+ * returned. On failure, the memory and `prev_size` are unchanged and the caller
+ * owns the returned error. Requesting the current size does not modify the
+ * allocation, but the store restrictions below still apply.
+ *
+ * All calls into this store must have returned, including suspended
+ * asynchronous calls. A request from a Wasm-to-host callback must be queued by
+ * the embedder and applied after the outermost call returns to C. Shrinking is
+ * rejected while a call is live. Stores with component instances, allocated
+ * Wasm continuations, or wmemcheck enabled are unsupported. The backing
+ * allocator must support shrinking.
+ * Pooled memories using protection keys are unsupported.
+ *
+ * The new size cannot exceed the current size or fall below the minimum of the
+ * defining memory or any instantiated module that imports it. The guest
+ * allocator must have relinquished the entire removed tail; this function
+ * cannot determine whether that tail contains live guest data.
+ * If the guest executes again before a queued request is applied, the embedder
+ * must ensure that the request is still valid and the tail has not been reused.
+ *
+ * The base pointer and address reservation remain unchanged. Whole host pages
+ * removed from the end are decommitted; any partial host page is retained.
+ * Removed contents are discarded and subsequent growth exposes zero bytes.
+ * Host pointers into the removed tail must no longer be used.
+ *
+ * See #wasmtime_memory_page_size for this memory's page size in bytes and
+ * #wasmtime_memory_grow for subsequent growth. The `examples/memory-shrink.c`
+ * example demonstrates queuing a request in a callback and applying it after
+ * Wasm returns.
+ */
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_memory_shrink(wasmtime_context_t *store,
+                       const wasmtime_memory_t *memory, uint64_t new_size,
+                       uint64_t *prev_size);
+
+/**
  * \brief Returns the size of a page, in bytes, for this memory.
  *
  * \param store the store that owns `memory`

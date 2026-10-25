@@ -360,6 +360,15 @@ impl Memory {
         }
     }
 
+    /// Shrink a local memory after the caller has established store quiescence.
+    pub fn shrink_to(&mut self, new_size: usize) -> Result<usize> {
+        // Reject shared memories and delegate local allocation bookkeeping
+        match self {
+            Memory::Local(mem) => mem.shrink_to(new_size),
+            Memory::Shared(_) => bail!("shared memories cannot be shrunk"),
+        }
+    }
+
     /// Return a `VMMemoryDefinition` for exposing the memory to compiled wasm code.
     pub fn vmmemory(&self) -> VMMemoryDefinition {
         match self {
@@ -506,6 +515,29 @@ impl LocalMemory {
 
     pub fn ty(&self) -> &wasmtime_environ::Memory {
         &self.ty
+    }
+
+    pub fn shrink_to(&mut self, new_size: usize) -> Result<usize> {
+        // Preserve the allocation's minimum and reject requests that would grow it
+        let old_size = self.alloc.byte_size();
+        ensure!(
+            new_size <= old_size,
+            "shrinking cannot increase memory size"
+        );
+        ensure!(
+            u64::try_from(new_size).unwrap() >= self.ty.minimum_byte_size()?,
+            "shrinking cannot go below the memory's declared minimum"
+        );
+        ensure!(
+            new_size % usize::try_from(self.ty.page_size()).unwrap() == 0,
+            "shrinking requires a whole number of WebAssembly pages"
+        );
+
+        // Leave no-op requests independent of allocator support
+        if new_size != old_size {
+            self.alloc.shrink_to(new_size)?;
+        }
+        Ok(old_size)
     }
 
     /// Grows a memory by `delta_pages`.

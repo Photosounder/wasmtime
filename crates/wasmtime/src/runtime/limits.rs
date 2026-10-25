@@ -97,6 +97,13 @@ pub trait ResourceLimiter: Send {
         Ok(())
     }
 
+    /// Notifies the limiter after a successful host-requested memory shrink.
+    ///
+    /// Both sizes are in bytes. This allows limiters that track total memory
+    /// usage to release the difference from their accounting. No notification
+    /// is made for a failed shrink or a request that leaves the size unchanged.
+    fn memory_shrunk(&mut self, _previous: usize, _current: usize) {}
+
     /// Notifies the resource limiter that an instance's table has been
     /// requested to grow.
     ///
@@ -184,6 +191,11 @@ pub trait ResourceLimiter: Send {
 #[cfg(feature = "async")]
 #[async_trait::async_trait]
 pub trait ResourceLimiterAsync: Send {
+    /// Identical to [`ResourceLimiter::memory_shrunk`].
+    ///
+    /// This notification is synchronous because shrinking does not suspend.
+    fn memory_shrunk(&mut self, _previous: usize, _current: usize) {}
+
     /// Async version of [`ResourceLimiter::memory_growing`]
     async fn memory_growing(
         &mut self,

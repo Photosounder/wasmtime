@@ -324,6 +324,15 @@ pub enum StoreResourceLimiter<'a> {
 }
 
 impl StoreResourceLimiter<'_> {
+    pub(crate) fn memory_shrunk(&mut self, previous: usize, current: usize) {
+        // Notify either limiter implementation after the new size is fully published
+        match self {
+            Self::Sync(limiter) => limiter.memory_shrunk(previous, current),
+            #[cfg(feature = "async")]
+            Self::Async(limiter) => limiter.memory_shrunk(previous, current),
+        }
+    }
+
     pub(crate) async fn memory_growing(
         &mut self,
         current: usize,
@@ -462,6 +471,7 @@ pub struct StoreOpaque {
 
     engine: Engine,
     vm_store_context: VMStoreContext,
+    pub(crate) wasm_call_depth: usize,
 
     // Contains all continuations ever allocated throughout the lifetime of this
     // store.
@@ -728,6 +738,7 @@ impl<T> Store<T> {
             _marker: marker::PhantomPinned,
             engine: engine.clone(),
             vm_store_context: Default::default(),
+            wasm_call_depth: 0,
             #[cfg(feature = "stack-switching")]
             continuations: Vec::new(),
             instances: TryPrimaryMap::new(),
@@ -1537,6 +1548,51 @@ fn bump(slot: &mut usize, max: usize, amt: usize, desc: &str) -> Result<()> {
 
 #[doc(hidden)]
 impl StoreOpaque {
+    pub(crate) fn validate_memory_shrink(
+        &self,
+        definition: NonNull<vm::VMMemoryDefinition>,
+        new_size: usize,
+    ) -> Result<()> {
+        // Exclude live calls and continuations that could retain previous bounds checks
+        ensure!(
+            self.wasm_call_depth == 0,
+            "memory shrinking requires all calls into the store to have returned"
+        );
+        #[cfg(feature = "stack-switching")]
+        ensure!(
+            self.continuations.is_empty(),
+            "memory shrinking is not supported after allocating Wasm continuations"
+        );
+        ensure!(
+            !self.engine.config().wmemcheck,
+            "memory shrinking is not supported with wmemcheck"
+        );
+
+        // Restrict this extension to core stores without component task or canonical ABI state
+        #[cfg(feature = "component-model")]
+        ensure!(
+            self.store_data
+                .components
+                .next_component_instance_id()
+                .as_u32()
+                == 0,
+            "memory shrinking is not supported in stores with component instances"
+        );
+
+        // Check every instance, including non-exported imports and host-created memories
+        let minimum = self
+            .instances
+            .iter()
+            .map(|(_, instance)| instance.handle.get().memory_shrink_minimum(definition))
+            .max()
+            .unwrap_or(0);
+        ensure!(
+            u64::try_from(new_size).unwrap() >= minimum,
+            "shrinking cannot go below a defining or importing module's minimum"
+        );
+        Ok(())
+    }
+
     pub fn id(&self) -> StoreId {
         self.store_data.id()
     }

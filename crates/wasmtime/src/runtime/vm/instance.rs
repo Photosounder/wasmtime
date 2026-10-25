@@ -768,6 +768,36 @@ impl Instance {
         crate::Tag::from_raw(StoreInstanceId::new(store, id), def_index)
     }
 
+    /// Return the minimum size this instance assumes for the given memory definition.
+    pub(crate) fn memory_shrink_minimum(&self, definition: NonNull<VMMemoryDefinition>) -> u64 {
+        // Include imported minimums that compiled code may use to eliminate bounds checks
+        self.env_module()
+            .memories
+            .iter()
+            .filter_map(|(index, memory)| {
+                let actual = match self.env_module().defined_memory_index(index) {
+                    Some(index) => self.memory_ptr(index),
+                    None => self.imported_memory(index).from.as_non_null(),
+                };
+                (actual == definition).then(|| memory.minimum_byte_size().unwrap_or(u64::MAX))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn memory_shrink(
+        mut self: Pin<&mut Self>,
+        index: DefinedMemoryIndex,
+        new_size: usize,
+    ) -> Result<usize> {
+        // Publish the changed length through the shared definition used by imports
+        let memory = &mut self.as_mut().memories_mut()[index].1;
+        let old_size = memory.shrink_to(new_size)?;
+        let definition = memory.vmmemory();
+        self.set_memory(index, definition);
+        Ok(old_size)
+    }
+
     /// Grow memory by the specified amount of pages.
     ///
     /// Returns `None` if memory can't be grown by the specified amount
