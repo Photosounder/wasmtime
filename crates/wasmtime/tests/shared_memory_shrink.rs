@@ -254,18 +254,21 @@ fn other_runner_keeps_executing_during_reclaim() -> Result<()> {
     let observed = unsafe { &*base.add(2) };
     let worker = std::thread::spawn(move || entry.call(&mut store, ()));
     let deadline = Instant::now() + Duration::from_secs(10);
-    while ready.load(SeqCst) == 0 && Instant::now() < deadline {
+    // Decode Wasm's little-endian atomic values on big-endian hosts such as s390x
+    while u32::from_le(ready.load(SeqCst)) == 0 && Instant::now() < deadline {
         std::thread::yield_now();
     }
 
     // Publish the smaller size and decommit while the worker continues its loop
     let shrink = unsafe { memory.shrink(2) };
-    while observed.load(SeqCst) != 2 && Instant::now() < deadline {
+    while u32::from_le(observed.load(SeqCst)) != 2 && Instant::now() < deadline {
         std::thread::yield_now();
     }
-    let saw_smaller = observed.load(SeqCst) == 2;
+    let saw_smaller = u32::from_le(observed.load(SeqCst)) == 2;
     let reclaim = unsafe { memory.reclaim() };
-    stop.store(1, SeqCst);
+
+    // Encode the stop flag in the byte order expected by the Wasm worker
+    stop.store(1u32.to_le(), SeqCst);
     worker.join().unwrap()?;
     shrink?;
     reclaim?;
