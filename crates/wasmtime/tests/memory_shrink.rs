@@ -104,7 +104,10 @@ fn pooled_shrink_updates_slot_and_regrows() -> Result<()> {
 }
 
 #[test]
-#[cfg(feature = "winch")]
+#[cfg(all(
+    feature = "winch",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn winch_shrink_updates_bounds() -> Result<()> {
     // Check that the baseline compiler also observes the published memory definition
     exercise_shrink(Config::new().strategy(Strategy::Winch))
