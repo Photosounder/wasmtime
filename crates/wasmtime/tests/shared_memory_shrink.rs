@@ -61,6 +61,10 @@ fn cached_code_requires_matching_bounds_policy() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(
+    default_target_pulley,
+    ignore = "Pulley does not support the Wasm threads proposal"
+)]
 fn memory64_shared_shrink_and_regrow() -> Result<()> {
     // Exercise 64-bit page arithmetic with the same shared allocation protocol
     let engine = engine()?;
@@ -135,6 +139,10 @@ fn regrowth_and_reclamation() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(
+    default_target_pulley,
+    ignore = "Pulley does not support the Wasm threads proposal"
+)]
 fn importing_minimums_and_cached_instances() -> Result<()> {
     // Pin the minimum of a module that imports without re-exporting its memory
     let engine = engine()?;
@@ -163,6 +171,10 @@ fn importing_minimums_and_cached_instances() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(
+    default_target_pulley,
+    ignore = "Pulley does not support the Wasm threads proposal"
+)]
 fn callback_visibility_and_tail_bounds() -> Result<()> {
     // Verify immediate publication and explicit bounds at each compiler optimization level
     for opt in [OptLevel::None, OptLevel::Speed, OptLevel::SpeedAndSize] {
@@ -229,6 +241,10 @@ fn callback_visibility_and_tail_bounds() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(
+    default_target_pulley,
+    ignore = "Pulley does not support the Wasm threads proposal"
+)]
 fn other_runner_keeps_executing_during_reclaim() -> Result<()> {
     // Keep a worker inside Wasm and restrict all its accesses to the retained prefix
     let engine = engine()?;
@@ -372,6 +388,10 @@ unsafe impl LinearMemory for RetainedOnlyMemory {
 }
 
 #[test]
+#[cfg_attr(
+    default_target_pulley,
+    ignore = "Pulley does not support the Wasm threads proposal"
+)]
 fn unsupported_reclaim_keeps_logical_shrink_and_allows_regrowth() -> Result<()> {
     // Use backing that supports quiescent shrinking but has not opted in to coordinated shrinking
     let mut config = Config::new();
